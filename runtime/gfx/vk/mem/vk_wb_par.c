@@ -29,7 +29,7 @@ typedef struct {
 
 static PlatMutex wp_lock = PLAT_MUTEX_INIT, wp_call = PLAT_MUTEX_INIT;
 static PlatCond wp_work = PLAT_COND_INIT, wp_idle = PLAT_COND_INIT;
-static WpJob *volatile wp_job;   // written under wp_lock; polled without it by spinning workers
+static WpJob *volatile wp_job;   // acquire/release publication; polled without wp_lock by spinning workers
 static int wp_threads = -1, wp_ab;
 static _Thread_local int wp_inside;
 static volatile int64_t wp_jobs, wp_items, wp_ns;
@@ -53,14 +53,14 @@ static void wp_main(void *arg) {
     wp_inside = 1;
     plat_mutex_lock(&wp_lock);
     for (;;) {
-        WpJob *j = wp_job;
+        WpJob *j = __atomic_load_n(&wp_job, __ATOMIC_ACQUIRE);
         if (!j || __atomic_load_n(&j->next, __ATOMIC_RELAXED) >= j->n) {
             plat_mutex_unlock(&wp_lock);
             uint64_t t0 = plat_now_ns();
             int seen = 0;
-            while (!(seen = __atomic_load_n(&wp_job, __ATOMIC_RELAXED) != j) && plat_now_ns() - t0 < WP_SPIN_NS) relax();
+            while (!(seen = __atomic_load_n(&wp_job, __ATOMIC_ACQUIRE) != j) && plat_now_ns() - t0 < WP_SPIN_NS) relax();
             plat_mutex_lock(&wp_lock);
-            if (!seen && wp_job == j) plat_cond_wait(&wp_work, &wp_lock);
+            if (!seen && __atomic_load_n(&wp_job, __ATOMIC_ACQUIRE) == j) plat_cond_wait(&wp_work, &wp_lock);
             continue;
         }
         j->active++;
@@ -98,7 +98,7 @@ void vk_wb_par(int n, void (*fn)(void *, int), void *ctx) {
     uint64_t t0 = plat_now_ns();
     WpJob j = {.fn = fn, .ctx = ctx, .n = n};
     plat_mutex_lock(&wp_lock);
-    wp_job = &j;
+    __atomic_store_n(&wp_job, &j, __ATOMIC_RELEASE);
     plat_cond_broadcast(&wp_work);
     plat_mutex_unlock(&wp_lock);
     wp_inside = 1;
@@ -106,7 +106,7 @@ void vk_wb_par(int n, void (*fn)(void *, int), void *ctx) {
     wp_inside = 0;
     plat_mutex_lock(&wp_lock);
     while (j.active) plat_cond_wait(&wp_idle, &wp_lock);
-    wp_job = NULL;   // after the last worker left: one arriving late finds next >= n while the job stands
+    __atomic_store_n(&wp_job, NULL, __ATOMIC_RELEASE);   // after the last worker left: one arriving late finds next >= n while the job stands
     plat_mutex_unlock(&wp_lock);
     plat_mutex_unlock(&wp_call);
     int64_t jobs = __atomic_add_fetch(&wp_jobs, 1, __ATOMIC_RELAXED);
